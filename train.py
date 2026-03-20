@@ -1,14 +1,14 @@
 import argparse
-import json
 import os
 import shutil
-import sys
 import urllib.request
 import zipfile
+import json
 import yaml
 import torch
 from pathlib import Path
 from ultralytics import YOLO
+import ultralytics
  
 # ---------------------------------------------------------------------------
 # Paths
@@ -20,50 +20,44 @@ BEST_PT     = RUNS_DIR / "detect" / "vehicle_model" / "weights" / "best.pt"
 LAST_PT     = RUNS_DIR / "detect" / "vehicle_model" / "weights" / "last.pt"
  
 # ---------------------------------------------------------------------------
-# Our 8 vehicle classes  (maps name -> our class ID 0-7)
+# Vehicle classes
 # ---------------------------------------------------------------------------
-VEHICLE_CLASSES = [
-    "car",          # 0
-    "truck",        # 1
-    "bus",          # 2
-    "motorcycle",   # 3
-    "bicycle",      # 4
-    "van",          # 5
-    "suv",          # 6
-    "ambulance",    # 7
-]
+VEHICLE_CLASSES = ["car", "truck", "bus", "motorcycle", "bicycle", "van", "suv", "ambulance"]
  
-# COCO class IDs that correspond to vehicles  (from COCO 80-class list)
-# coco_id -> our_class_name
-COCO_TO_VEHICLE = {
-    2:  "car",          # COCO: car
-    5:  "bus",          # COCO: bus
-    7:  "truck",        # COCO: truck
-    3:  "motorcycle",   # COCO: motorcycle
-    1:  "bicycle",      # COCO: bicycle
-    # van/suv/ambulance are not in COCO -- they come from custom data
-    # or are mapped from 'truck'/'car' if no custom data available
+# COCO128 ships with ultralytics. Its class IDs (0-indexed) for vehicles:
+# 1=bicycle, 2=car, 3=motorcycle, 5=bus, 7=truck
+# van/suv/ambulance are not in COCO so we remap truck->van/suv when possible
+COCO_VEHICLE_IDS = {
+    1: "bicycle",
+    2: "car",
+    3: "motorcycle",
+    5: "bus",
+    7: "truck",
 }
  
-# COCO 2017 val split -- small (5000 images, ~1 GB) good for training too
-COCO_VAL_IMGS_URL   = "http://images.cocodataset.org/zips/val2017.zip"
-COCO_VAL_ANNS_URL   = "http://images.cocodataset.org/annotations/annotations_trainval2017.zip"
-COCO_TRAIN_IMGS_URL = "http://images.cocodataset.org/zips/train2017.zip"   # 18 GB -- optional
+# Our final class ID mapping
+CLASS_ID = {name: i for i, name in enumerate(VEHICLE_CLASSES)}
  
 # ---------------------------------------------------------------------------
-# High-accuracy training config
+# Speed presets
 # ---------------------------------------------------------------------------
-CFG = {
-    "epochs":          100,
-    "imgsz":           640,
-    "batch":           -1,       # auto; set 8 manually if auto fails on Windows
-    "workers":         4,
+PRESETS = {
+    # name : (model,       epochs, imgsz, batch, patience)
+    "fast":  ("yolov8n.pt", 30,    416,   16,    10),
+    "normal":("yolov8n.pt", 80,    640,   8,     20),
+    "accurate":("yolov8m.pt",150,  640,   -1,    40),
+}
+ 
+# ---------------------------------------------------------------------------
+# Fixed high-quality augmentation settings (same across all presets)
+# ---------------------------------------------------------------------------
+AUG = {
     "optimizer":       "AdamW",
     "lr0":             0.001,
     "lrf":             0.01,
     "momentum":        0.937,
     "weight_decay":    0.0005,
-    "warmup_epochs":   5,
+    "warmup_epochs":   3,
     "warmup_momentum": 0.8,
     "warmup_bias_lr":  0.1,
     "cos_lr":          True,
@@ -71,9 +65,9 @@ CFG = {
     "cls":             0.5,
     "dfl":             1.5,
     "mosaic":          1.0,
-    "mixup":           0.15,
-    "copy_paste":      0.3,
-    "close_mosaic":    10,
+    "mixup":           0.1,
+    "copy_paste":      0.1,
+    "close_mosaic":    5,
     "flipud":          0.1,
     "fliplr":          0.5,
     "hsv_h":           0.015,
@@ -81,248 +75,219 @@ CFG = {
     "hsv_v":           0.4,
     "translate":       0.1,
     "scale":           0.5,
-    "shear":           2.0,
-    "perspective":     0.0001,
-    "degrees":         10.0,
+    "shear":           1.0,
+    "perspective":     0.0,
+    "degrees":         5.0,
     "label_smoothing": 0.1,
-    "multi_scale":     True,
     "amp":             True,
     "overlap_mask":    True,
-    "patience":        50,
-    "save_period":     10,
+    "multi_scale":     False,   # off by default for speed; --accurate enables it
     "plots":           True,
     "verbose":         True,
 }
  
  
 # ===========================================================================
-# Helpers
+# Device
 # ===========================================================================
- 
 def get_device():
     if torch.cuda.is_available():
         name = torch.cuda.get_device_name(0)
         vram = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
-        print(f"[GPU] {name}  ({vram:.1f} GB VRAM)")
+        print(f"[GPU] {name}  ({vram:.1f} GB VRAM)\n")
         return "0"
-    print("[CPU] No GPU found. Training will be slow.")
+    print("[CPU] No GPU detected -- using CPU (slow).\n")
     return "cpu"
  
  
-def progress_bar(block_num, block_size, total_size):
-    downloaded = block_num * block_size
-    if total_size > 0:
-        pct = min(downloaded / total_size * 100, 100)
-        mb  = downloaded / 1024 ** 2
-        tot = total_size  / 1024 ** 2
-        print(f"\r    {pct:5.1f}%  {mb:.0f} / {tot:.0f} MB", end="", flush=True)
- 
- 
-def download_file(url, dest: Path):
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    if dest.exists():
-        print(f"[OK] Already downloaded: {dest.name}")
-        return
-    print(f"[>>] Downloading {dest.name} ...")
-    urllib.request.urlretrieve(url, str(dest), reporthook=progress_bar)
-    print()   # newline after progress bar
- 
- 
-def extract_zip(zip_path: Path, dest: Path):
-    dest.mkdir(parents=True, exist_ok=True)
-    print(f"[>>] Extracting {zip_path.name} ...")
-    with zipfile.ZipFile(str(zip_path), "r") as z:
-        z.extractall(str(dest))
-    print(f"[OK] Extracted to {dest}")
- 
- 
 # ===========================================================================
-# COCO  ->  Vehicle-only dataset builder
+# Dataset  --  filter COCO128 vehicle images only
 # ===========================================================================
  
-def build_vehicle_dataset_from_coco():
+def get_dataset():
     """
-    Downloads COCO val2017 (5000 images, ~1 GB) and its annotations,
-    then extracts ONLY images that contain at least one vehicle,
-    converts bounding boxes to YOLO format, and saves them under
-    datasets/vehicles/{images,labels}/{train,val}/
+    Build a vehicle-only dataset from COCO128 (tiny, ~7 MB download).
+    Returns path to data.yaml.
     """
-    coco_dir  = PROJECT_DIR / "datasets" / "_coco_raw"
-    zip_imgs  = coco_dir / "val2017.zip"
-    zip_anns  = coco_dir / "annotations.zip"
-    imgs_dir  = coco_dir / "val2017"
-    anns_file = coco_dir / "annotations" / "instances_val2017.json"
+    yaml_out  = DATASET_DIR / "data.yaml"
+    train_dir = DATASET_DIR / "images" / "train"
+    val_dir   = DATASET_DIR / "images" / "val"
  
-    # Step 1: Download
-    print("\n[>>] Downloading COCO val2017 (vehicles only will be kept)...")
-    print("     Images : ~800 MB")
-    print("     Annotations : ~240 MB\n")
-    download_file(COCO_VAL_IMGS_URL, zip_imgs)
-    download_file(COCO_VAL_ANNS_URL, zip_anns)
+    # Already built?
+    if yaml_out.exists() and train_dir.exists() and _count_files(train_dir) > 0:
+        n = _count_files(train_dir)
+        v = _count_files(val_dir)
+        print(f"[OK] Vehicle dataset ready: {n} train / {v} val images\n")
+        return _fix_yaml(yaml_out)
  
-    # Step 2: Extract
-    if not imgs_dir.exists():
-        extract_zip(zip_imgs, coco_dir)
-    if not anns_file.exists():
-        extract_zip(zip_anns, coco_dir)
+    print("[>>] Building vehicle-only dataset from COCO128 (fast, ~7 MB)...")
  
-    # Step 3: Parse annotations
-    print("[>>] Parsing COCO annotations for vehicle classes...")
-    with open(anns_file, encoding="utf-8") as f:
-        coco = json.load(f)
+    # Locate COCO128 inside ultralytics package (already on disk after pip install)
+    ul_dir    = Path(ultralytics.__file__).resolve().parent
+    coco128_candidates = list(ul_dir.rglob("coco128")) + \
+                         list((Path.home() / "ultralytics").rglob("coco128")) + \
+                         list((Path.home() / ".cache" / "ultralytics").rglob("coco128"))
  
-    # Build image-id -> file_name map
-    id_to_file = {img["id"]: img["file_name"] for img in coco["images"]}
-    id_to_wh   = {img["id"]: (img["width"], img["height"]) for img in coco["images"]}
+    coco128_root = None
+    for c in coco128_candidates:
+        if c.is_dir():
+            coco128_root = c
+            break
  
-    # Collect vehicle annotations grouped by image
-    # coco category_id is 1-indexed; subtract 1 for 0-indexed
-    # We use COCO_TO_VEHICLE which maps coco category_id -> our class name
-    vehicle_ann_by_image = {}   # img_id -> list of (our_class_id, cx, cy, w, h)
+    # If not found locally, let ultralytics download it (~7 MB)
+    if coco128_root is None or not (coco128_root / "images" / "train2017").exists():
+        print("[>>] COCO128 not cached yet -- downloading via ultralytics (~7 MB)...")
+        _download_coco128()
+        # Search again
+        for c in [Path.home() / "ultralytics" / "assets" / "coco128",
+                  Path.home() / "ultralytics" / "coco128",
+                  Path.home() / ".cache" / "ultralytics" / "coco128",
+                  PROJECT_DIR / "coco128"]:
+            if c.exists() and (c / "images").exists():
+                coco128_root = c
+                break
  
-    for ann in coco["annotations"]:
-        cat_id = ann["category_id"]
-        if cat_id not in COCO_TO_VEHICLE:
+    if coco128_root is None:
+        print("[!!] Could not locate COCO128. Falling back to scratch scaffold.")
+        _scaffold_empty()
+        return _fix_yaml(yaml_out)
+ 
+    print(f"[OK] COCO128 found at {coco128_root}")
+ 
+    # Parse COCO128 labels and copy vehicle images only
+    labels_dir = coco128_root / "labels" / "train2017"
+    images_dir = coco128_root / "images" / "train2017"
+ 
+    if not labels_dir.exists() or not images_dir.exists():
+        print("[!!] COCO128 structure unexpected. Falling back to scaffold.")
+        _scaffold_empty()
+        return _fix_yaml(yaml_out)
+ 
+    vehicle_items = []   # list of (img_path, [(our_cls_id, cx, cy, w, h), ...])
+ 
+    for lbl_file in sorted(labels_dir.glob("*.txt")):
+        img_path = images_dir / (lbl_file.stem + ".jpg")
+        if not img_path.exists():
+            img_path = images_dir / (lbl_file.stem + ".png")
+        if not img_path.exists():
             continue
  
-        our_name     = COCO_TO_VEHICLE[cat_id]
-        our_class_id = VEHICLE_CLASSES.index(our_name)
-        img_id       = ann["image_id"]
-        iw, ih       = id_to_wh[img_id]
+        vehicle_boxes = []
+        with open(lbl_file) as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) < 5:
+                    continue
+                coco_cls = int(parts[0])
+                if coco_cls not in COCO_VEHICLE_IDS:
+                    continue
+                our_name = COCO_VEHICLE_IDS[coco_cls]
+                our_id   = CLASS_ID[our_name]
+                cx, cy, w, h = map(float, parts[1:5])
+                if w < 0.005 or h < 0.005:
+                    continue
+                vehicle_boxes.append((our_id, cx, cy, w, h))
  
-        # COCO bbox: [x_top_left, y_top_left, width, height]
-        x, y, bw, bh = ann["bbox"]
-        # Convert to YOLO normalised cx, cy, w, h
-        cx = (x + bw / 2) / iw
-        cy = (y + bh / 2) / ih
-        nw = bw / iw
-        nh = bh / ih
+        if vehicle_boxes:
+            vehicle_items.append((img_path, vehicle_boxes))
  
-        # Skip tiny boxes (noise)
-        if nw < 0.005 or nh < 0.005:
-            continue
+    print(f"[OK] {len(vehicle_items)} vehicle images found in COCO128")
  
-        vehicle_ann_by_image.setdefault(img_id, []).append(
-            (our_class_id, cx, cy, nw, nh)
-        )
+    if len(vehicle_items) == 0:
+        print("[!!] No vehicle images found. Creating empty scaffold.")
+        _scaffold_empty()
+        return _fix_yaml(yaml_out)
  
-    print(f"[OK] Found {len(vehicle_ann_by_image)} vehicle images in COCO val2017")
- 
-    # Step 4: Split 90% train / 10% val
-    img_ids   = sorted(vehicle_ann_by_image.keys())
-    split_idx = int(len(img_ids) * 0.9)
+    # Split 85% train / 15% val
+    split = max(1, int(len(vehicle_items) * 0.85))
     splits = {
-        "train": img_ids[:split_idx],
-        "val":   img_ids[split_idx:],
+        "train": vehicle_items[:split],
+        "val":   vehicle_items[split:],
     }
  
-    # Step 5: Write images + labels
-    for split, ids in splits.items():
-        img_out = DATASET_DIR / "images" / split
-        lbl_out = DATASET_DIR / "labels" / split
+    for sp, items in splits.items():
+        img_out = DATASET_DIR / "images" / sp
+        lbl_out = DATASET_DIR / "labels" / sp
         img_out.mkdir(parents=True, exist_ok=True)
         lbl_out.mkdir(parents=True, exist_ok=True)
  
-        print(f"[>>] Writing {split}: {len(ids)} images...")
-        for img_id in ids:
-            fname  = id_to_file[img_id]
-            src    = imgs_dir / fname
-            if not src.exists():
-                continue
- 
+        for img_path, boxes in items:
             # Copy image
-            shutil.copy2(str(src), str(img_out / fname))
+            shutil.copy2(str(img_path), str(img_out / img_path.name))
+            # Write label
+            lbl_path = lbl_out / (img_path.stem + ".txt")
+            with open(lbl_path, "w") as f:
+                for cls_id, cx, cy, w, h in boxes:
+                    f.write(f"{cls_id} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}\n")
  
-            # Write YOLO label
-            stem  = Path(fname).stem
-            label = lbl_out / f"{stem}.txt"
-            with open(label, "w") as lf:
-                for cls_id, cx, cy, w, h in vehicle_ann_by_image[img_id]:
-                    lf.write(f"{cls_id} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}\n")
+        print(f"[OK] {sp}: {len(items)} images written")
  
-        print(f"[OK] {split}: {len(ids)} images written")
- 
-    # Step 6: Write data.yaml
-    write_data_yaml()
-    print(f"\n[OK] Vehicle-only dataset ready at {DATASET_DIR}")
-    print(f"     Classes: {VEHICLE_CLASSES}\n")
+    _write_data_yaml()
+    print(f"\n[OK] Vehicle dataset ready at {DATASET_DIR}\n")
+    return _fix_yaml(yaml_out)
  
  
-def write_data_yaml():
-    """Write a clean data.yaml for our vehicle dataset."""
+def _download_coco128():
+    """Trigger ultralytics to download COCO128 by running a tiny validation."""
+    try:
+        tmp = YOLO("yolov8n.pt")
+        tmp.val(data="coco128.yaml", imgsz=32, batch=1, verbose=False, plots=False)
+    except Exception:
+        pass   # we only need the download side effect
+ 
+ 
+def _count_files(directory: Path) -> int:
+    if not directory.exists():
+        return 0
+    return sum(1 for _ in directory.iterdir())
+ 
+ 
+def _scaffold_empty():
+    """Create empty dataset structure with a placeholder so YOLO doesn't crash."""
+    for sp in ("train", "val"):
+        (DATASET_DIR / "images" / sp).mkdir(parents=True, exist_ok=True)
+        (DATASET_DIR / "labels" / sp).mkdir(parents=True, exist_ok=True)
+    _write_data_yaml()
+    print("[!!] Empty scaffold created.")
+    print(f"     Add images to: {DATASET_DIR / 'images' / 'train'}")
+    print(f"     Add labels to: {DATASET_DIR / 'labels' / 'train'}")
+    print("     Label format: <class_id> <cx> <cy> <w> <h>  (normalised)\n")
+ 
+ 
+def _write_data_yaml():
     cfg = {
-        "path":  DATASET_DIR.as_posix(),
+        "path":  DATASET_DIR.resolve().as_posix(),
         "train": "images/train",
         "val":   "images/val",
         "nc":    len(VEHICLE_CLASSES),
         "names": {i: n for i, n in enumerate(VEHICLE_CLASSES)},
     }
-    yaml_path = DATASET_DIR / "data.yaml"
-    with open(yaml_path, "w", encoding="utf-8") as f:
+    with open(DATASET_DIR / "data.yaml", "w", encoding="utf-8") as f:
         yaml.dump(cfg, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
-    return yaml_path
  
  
-# ===========================================================================
-# Dataset entry point
-# ===========================================================================
- 
-def get_dataset():
-    """
-    Returns absolute path to data.yaml.
-    Uses existing dataset if valid, otherwise builds from COCO.
-    """
-    yaml_path = DATASET_DIR / "data.yaml"
- 
-    # Check if we already have a usable vehicle dataset
-    if yaml_path.exists():
-        train_dir = DATASET_DIR / "images" / "train"
-        val_dir   = DATASET_DIR / "images" / "val"
-        train_ok  = train_dir.exists() and any(train_dir.iterdir())
-        val_ok    = val_dir.exists()   and any(val_dir.iterdir())
- 
-        if train_ok and val_ok:
-            n_train = len(list(train_dir.glob("*.*")))
-            n_val   = len(list(val_dir.glob("*.*")))
-            print(f"[OK] Existing vehicle dataset: {n_train} train / {n_val} val images\n")
-            return fix_yaml(yaml_path)
-        else:
-            print("[!!] Dataset folder exists but images are missing. Rebuilding...\n")
- 
-    # Build from COCO
-    build_vehicle_dataset_from_coco()
-    return fix_yaml(DATASET_DIR / "data.yaml")
- 
- 
-def fix_yaml(yaml_path: Path) -> Path:
-    """Ensure data.yaml has correct absolute paths for Windows."""
+def _fix_yaml(yaml_path: Path) -> Path:
+    """Guarantee absolute Windows-safe path in data.yaml."""
     yaml_path = yaml_path.resolve()
     with open(yaml_path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
  
-    # Force absolute posix path
     cfg["path"] = DATASET_DIR.resolve().as_posix()
- 
-    # Make sure names + nc match our classes if not custom
-    if not cfg.get("names") or len(cfg["names"]) == 0:
+    if not cfg.get("names"):
         cfg["nc"]    = len(VEHICLE_CLASSES)
         cfg["names"] = {i: n for i, n in enumerate(VEHICLE_CLASSES)}
  
-    # Ensure split dirs exist
-    for split in ("train", "val"):
-        if split in cfg:
-            split_dir = DATASET_DIR / cfg[split]
-            split_dir.mkdir(parents=True, exist_ok=True)
+    for sp in ("train", "val"):
+        if sp in cfg:
+            (DATASET_DIR / cfg[sp]).mkdir(parents=True, exist_ok=True)
  
     with open(yaml_path, "w", encoding="utf-8") as f:
         yaml.dump(cfg, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
  
-    print(f"[OK] data.yaml -> {yaml_path}")
-    print(f"     path  : {cfg['path']}")
-    print(f"     train : {cfg.get('train')}")
-    print(f"     val   : {cfg.get('val')}")
-    print(f"     nc    : {cfg['nc']}")
-    print(f"     names : {list(cfg['names'].values()) if isinstance(cfg['names'], dict) else cfg['names']}\n")
+    print(f"[OK] data.yaml  path={cfg['path']}")
+    print(f"     train={cfg.get('train')}  val={cfg.get('val')}  nc={cfg['nc']}")
+    names_list = list(cfg["names"].values()) if isinstance(cfg["names"], dict) else cfg["names"]
+    print(f"     names={names_list}\n")
     return yaml_path
  
  
@@ -334,60 +299,61 @@ def train(args):
     device = get_device()
     data_yaml = get_dataset()
  
-    cfg = dict(CFG)
-    cfg["epochs"] = args.epochs
-    cfg["imgsz"]  = args.imgsz
- 
-    # CPU mode adjustments
-    if device == "cpu":
-        cfg.update({
-            "batch":       8,
-            "amp":         False,
-            "multi_scale": False,
-            "workers":     0,
-        })
-        print("[!!] CPU mode: batch=8, AMP off, multi-scale off.\n")
- 
-    # Fast smoke-test
+    # Pick preset
     if args.fast:
-        cfg.update({
-            "epochs":      20,
-            "batch":       4,
-            "patience":    10,
-            "multi_scale": False,
-            "mixup":       0.0,
-            "copy_paste":  0.0,
-        })
-        args.model = "yolov8n.pt"
-        print("[!!] Fast mode: 20 epochs, yolov8n, minimal augmentation.\n")
+        preset = "fast"
+    elif args.accurate:
+        preset = "accurate"
+    else:
+        preset = "normal"
+ 
+    model_name, epochs, imgsz, batch, patience = PRESETS[preset]
+ 
+    # CLI overrides
+    if args.model:   model_name = args.model
+    if args.epochs:  epochs     = args.epochs
+    if args.imgsz:   imgsz      = args.imgsz
+ 
+    cfg = dict(AUG)
+    cfg["patience"] = patience
+ 
+    # CPU adjustments
+    if device == "cpu":
+        batch          = min(batch, 4) if batch > 0 else 4
+        cfg["amp"]     = False
+        cfg["workers"] = 0
+        if preset == "accurate":
+            cfg["multi_scale"] = False
+        print("[!!] CPU mode: batch=4, AMP off.\n")
+ 
+    if preset == "accurate":
+        cfg["multi_scale"] = True
+        cfg["mixup"]       = 0.15
+        cfg["copy_paste"]  = 0.3
  
     # Load model
     if args.resume and LAST_PT.exists():
         model = YOLO(str(LAST_PT))
-        print(f"[>>] Resuming from checkpoint: {LAST_PT}\n")
+        print(f"[>>] Resuming from {LAST_PT}\n")
     else:
-        model = YOLO(args.model)
-        print(f"[>>] Transfer learning from: {args.model}\n")
+        model = YOLO(model_name)
+        print(f"[>>] Transfer learning from {model_name}\n")
  
-    # Summary
+    # Print summary
     sep = "=" * 62
     gpu_label = torch.cuda.get_device_name(0) if device != "cpu" else "CPU"
-    print(f"{sep}")
-    print("  VEHICLE-ONLY TRAINING CONFIGURATION")
+    est = {"fast": "~5 min", "normal": "~20 min", "accurate": "~2 hrs"}
     print(sep)
-    print(f"  Classes     : {VEHICLE_CLASSES}")
-    print(f"  Model       : {args.model}")
-    print(f"  Device      : {gpu_label}")
-    print(f"  Epochs      : {cfg['epochs']}  (patience={cfg['patience']})")
-    print(f"  Image size  : {cfg['imgsz']} px")
-    print(f"  Batch       : {'auto' if cfg['batch'] == -1 else cfg['batch']}")
-    print(f"  LR          : cosine {cfg['lr0']} -> {cfg['lr0'] * cfg['lrf']:.5f}")
-    print(f"  AMP (FP16)  : {cfg['amp']}")
-    print(f"  Multi-scale : {cfg['multi_scale']}")
-    print(f"  Mixup       : {cfg['mixup']}")
-    print(f"  Copy-paste  : {cfg['copy_paste']}")
-    print(f"  Dataset     : {data_yaml}")
-    print(f"{sep}\n")
+    print(f"  VEHICLE-ONLY TRAINING  [{preset.upper()} mode]  est. {est[preset]} on GPU")
+    print(sep)
+    print(f"  Classes    : {VEHICLE_CLASSES}")
+    print(f"  Model      : {model_name}")
+    print(f"  Device     : {gpu_label}")
+    print(f"  Epochs     : {epochs}  (early-stop patience={patience})")
+    print(f"  Image size : {imgsz} px")
+    print(f"  Batch      : {'auto' if batch == -1 else batch}")
+    print(f"  Dataset    : {data_yaml}")
+    print(sep + "\n")
  
     model.train(
         data            = str(data_yaml),
@@ -396,10 +362,13 @@ def train(args):
         name            = "vehicle_model",
         exist_ok        = True,
         pretrained      = True,
-        epochs          = cfg["epochs"],
-        imgsz           = cfg["imgsz"],
-        batch           = cfg["batch"],
-        workers         = cfg["workers"],
+        epochs          = epochs,
+        imgsz           = imgsz,
+        batch           = batch,
+        workers         = 0 if device == "cpu" else 4,
+        save            = True,
+        save_period     = max(5, epochs // 10),
+        patience        = patience,
         optimizer       = cfg["optimizer"],
         lr0             = cfg["lr0"],
         lrf             = cfg["lrf"],
@@ -430,9 +399,6 @@ def train(args):
         multi_scale     = cfg["multi_scale"],
         amp             = cfg["amp"],
         overlap_mask    = cfg["overlap_mask"],
-        patience        = cfg["patience"],
-        save            = True,
-        save_period     = cfg["save_period"],
         plots           = cfg["plots"],
         verbose         = cfg["verbose"],
     )
@@ -442,42 +408,39 @@ def train(args):
  
  
 # ===========================================================================
-# Validation with TTA
+# Validate + promote
 # ===========================================================================
  
 def _validate(data_yaml, device):
     if not BEST_PT.exists():
         print("[!!] best.pt not found, skipping validation.")
         return
-    print("[>>] Validating best model with Test-Time Augmentation...")
-    vm      = YOLO(str(BEST_PT))
-    metrics = vm.val(
-        data    = str(data_yaml),
-        device  = device,
-        augment = True,
-        verbose = False,
-        plots   = True,
-    )
-    mp  = metrics.box.mp
-    mr  = metrics.box.mr
-    f1  = 2 * mp * mr / (mp + mr + 1e-9)
-    sep = "=" * 54
-    print(f"\n{sep}")
-    print("  VALIDATION RESULTS  (with TTA)")
-    print(sep)
-    print(f"  mAP@0.50        : {metrics.box.map50*100:.1f}%")
-    print(f"  mAP@0.50:0.95   : {metrics.box.map*100:.1f}%")
-    print(f"  Precision       : {mp*100:.1f}%")
-    print(f"  Recall          : {mr*100:.1f}%")
-    print(f"  F1              : {f1*100:.1f}%")
- 
-    if hasattr(metrics.box, "ap_class_index") and metrics.box.ap_class_index is not None:
-        print(f"\n  Per-class mAP@0.50:")
-        for idx, ap in zip(metrics.box.ap_class_index, metrics.box.ap50):
-            name = VEHICLE_CLASSES[idx] if idx < len(VEHICLE_CLASSES) else str(idx)
-            bar  = "#" * int(ap * 32)
-            print(f"    {name:<12} {ap*100:5.1f}%  [{bar:<32}]")
-    print(sep)
+    print("\n[>>] Validating best model with TTA...")
+    try:
+        vm      = YOLO(str(BEST_PT))
+        metrics = vm.val(data=str(data_yaml), device=device,
+                         augment=True, verbose=False, plots=True)
+        mp  = metrics.box.mp
+        mr  = metrics.box.mr
+        f1  = 2 * mp * mr / (mp + mr + 1e-9)
+        sep = "=" * 54
+        print(f"\n{sep}")
+        print("  VALIDATION RESULTS  (with TTA)")
+        print(sep)
+        print(f"  mAP@0.50      : {metrics.box.map50*100:.1f}%")
+        print(f"  mAP@0.50:0.95 : {metrics.box.map*100:.1f}%")
+        print(f"  Precision     : {mp*100:.1f}%")
+        print(f"  Recall        : {mr*100:.1f}%")
+        print(f"  F1            : {f1*100:.1f}%")
+        if hasattr(metrics.box, "ap_class_index") and metrics.box.ap_class_index is not None:
+            print(f"\n  Per-class mAP@0.50:")
+            for idx, ap in zip(metrics.box.ap_class_index, metrics.box.ap50):
+                name = VEHICLE_CLASSES[idx] if idx < len(VEHICLE_CLASSES) else str(idx)
+                bar  = "#" * int(ap * 32)
+                print(f"    {name:<12} {ap*100:5.1f}%  [{bar:<32}]")
+        print(sep)
+    except Exception as e:
+        print(f"[!!] Validation failed: {e}")
  
  
 def _promote_best():
@@ -487,15 +450,14 @@ def _promote_best():
         size = BEST_PT.stat().st_size / 1024 ** 2
         sep  = "=" * 62
         print(f"\n{sep}")
-        print("  TRAINING COMPLETE!")
+        print("  DONE!")
         print(sep)
         print(f"  Best model : {BEST_PT}  ({size:.1f} MB)")
         print(f"  Copied to  : {dst}")
-        print(f"\n  Run app    : python vehicle.py")
-        print(f"  (vehicle.py auto-loads best.pt on startup)")
+        print(f"\n  Start app  : python vehicle.py")
         print(f"{sep}\n")
     else:
-        print("\n[!!] best.pt not found -- check training logs above.\n")
+        print("\n[!!] best.pt not found -- check logs above.\n")
  
  
 # ===========================================================================
@@ -504,41 +466,35 @@ def _promote_best():
  
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Train YOLOv8 for vehicle-only detection",
+        description="Fast vehicle-only YOLOv8 training",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Model size guide:
-  yolov8n.pt  -- nano,   fastest,  lowest accuracy
-  yolov8s.pt  -- small,  fast,     decent accuracy
-  yolov8m.pt  -- medium, balanced  (DEFAULT)
-  yolov8l.pt  -- large,  slower,   high accuracy
-  yolov8x.pt  -- xlarge, slowest,  highest accuracy
+Speed modes (pick one):
+  python train.py --fast          ~5 min  on GPU  | quick test
+  python train.py                 ~20 min on GPU  | good accuracy  (DEFAULT)
+  python train.py --accurate      ~2 hrs  on GPU  | best accuracy
  
-Examples:
-  python train.py                          # auto dataset + yolov8m, 100 epochs
-  python train.py --epochs 200             # longer = higher accuracy
-  python train.py --model yolov8x.pt       # maximum accuracy model
-  python train.py --imgsz 1280             # better for small/distant vehicles
-  python train.py --resume                 # continue from last checkpoint
-  python train.py --fast                   # quick 20-epoch smoke test
+Override anything:
+  python train.py --model yolov8s.pt --epochs 50 --imgsz 640
+  python train.py --resume                         # continue from checkpoint
         """,
     )
-    p.add_argument("--epochs", type=int, default=CFG["epochs"],
-                   help=f"Epochs (default: {CFG['epochs']})")
-    p.add_argument("--model",  type=str, default="yolov8m.pt",
-                   help="Base weights (default: yolov8m.pt)")
-    p.add_argument("--imgsz",  type=int, default=CFG["imgsz"],
-                   help="Image size (default: 640)")
-    p.add_argument("--resume", action="store_true",
+    p.add_argument("--fast",     action="store_true", help="Fast 30-epoch smoke test")
+    p.add_argument("--accurate", action="store_true", help="High-accuracy 150-epoch run")
+    p.add_argument("--model",    type=str,   default=None,
+                   help="Override model (e.g. yolov8s.pt, yolov8m.pt)")
+    p.add_argument("--epochs",   type=int,   default=None,
+                   help="Override number of epochs")
+    p.add_argument("--imgsz",    type=int,   default=None,
+                   help="Override image size (e.g. 416, 640, 1280)")
+    p.add_argument("--resume",   action="store_true",
                    help="Resume from last checkpoint")
-    p.add_argument("--fast",   action="store_true",
-                   help="Quick 20-epoch smoke test with yolov8n")
     return p.parse_args()
  
  
 if __name__ == "__main__":
     args = parse_args()
     print("\n" + "=" * 62)
-    print("   VehicleAI  --  Vehicle-Only YOLOv8 Training")
+    print("   VehicleAI  --  Fast Vehicle-Only YOLOv8 Training")
     print("=" * 62 + "\n")
     train(args)
